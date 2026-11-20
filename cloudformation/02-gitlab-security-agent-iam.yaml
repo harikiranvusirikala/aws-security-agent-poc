@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitLab OIDC roles for the AWS Security Agent POC.
+
+Parameters:
+  GitLabProjectPath:
+    Type: String
+    Description: Exact GitLab project path, for example my-group/aws-security-agent-poc.
+  GitLabBranch:
+    Type: String
+    Default: main
+  GitLabOIDCProviderArn:
+    Type: String
+    Description: Existing GitLab OIDC provider ARN.
+  ArtifactBucketName:
+    Type: String
+
+Resources:
+  GitLabDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: security-agent-poc-gitlab-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitLabOIDCProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                gitlab.com:aud: https://gitlab.com
+              StringLike:
+                gitlab.com:sub: !Sub project_path:${GitLabProjectPath}:ref_type:branch:ref:${GitLabBranch}
+      Policies:
+        - PolicyName: deploy-poc
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucketName}
+                  - !Sub arn:aws:s3:::${ArtifactBucketName}/*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:TagRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                  - apigateway:*
+                  - apigatewayv2:*
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - route53:ListResourceRecordSets
+                  - acm:RequestCertificate
+                  - acm:DescribeCertificate
+                  - acm:DeleteCertificate
+                  - acm:ListCertificates
+                  - logs:*
+                Resource: '*'
+
+  GitLabSecurityAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: security-agent-poc-gitlab-securityagent
+      MaxSessionDuration: 4200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitLabOIDCProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                gitlab.com:aud: https://gitlab.com
+              StringLike:
+                gitlab.com:sub: !Sub project_path:${GitLabProjectPath}:ref_type:branch:ref:${GitLabBranch}
+      Policies:
+        - PolicyName: securityagent-run-pentest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityagent:StartPentestJob
+                  - securityagent:BatchGetPentestJobs
+                  - securityagent:StopPentestJob
+                  - securityagent:ListFindings
+                  - securityagent:BatchGetFindings
+                  - securityagent:ListIntegratedResources
+                Resource: '*'
+
+Outputs:
+  GitLabDeploymentRoleArn:
+    Value: !GetAtt GitLabDeploymentRole.Arn
+  GitLabSecurityAgentRoleArn:
+    Value: !GetAtt GitLabSecurityAgentRole.Arn
