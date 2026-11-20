@@ -1,0 +1,89 @@
+stages:
+  - build
+  - deploy-preprod
+  - security-gate
+  - deploy-prod
+
+workflow:
+  rules:
+    # The Security Agent component creates baseline tags. Do not trigger
+    # another pipeline from those tags.
+    - if: '$CI_COMMIT_TAG =~ /^continuum\/pentest\/cicd\/baseline\//'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+variables:
+  PREPROD_STACK_NAME: security-agent-poc-preprod
+  PROD_STACK_NAME: security-agent-poc-prod
+  PREPROD_DOMAIN_NAME: pentest-preprod.example.com
+  PROD_DOMAIN_NAME: pentest-prod.example.com
+
+build:
+  stage: build
+  image: amazon/aws-cli:latest
+  script:
+    - aws cloudformation validate-template --template-body file://cloudformation/00-artifact-bucket.yaml
+    - aws cloudformation validate-template --template-body file://cloudformation/01-application.yaml
+    - aws cloudformation validate-template --template-body file://cloudformation/02-gitlab-security-agent-iam.yaml
+    - echo "CloudFormation validation passed."
+
+deploy-preprod:
+  stage: deploy-preprod
+  image: amazon/aws-cli:latest
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - export AWS_ROLE_ARN="$DEPLOYMENT_ROLE_ARN"
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/gitlab-oidc-token"
+    - printf '%s' "$AWS_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+    - aws sts get-caller-identity
+    - yum install -y zip >/dev/null 2>&1 || true
+  script:
+    - rm -rf build && mkdir build
+    - cd app && zip -q -r ../build/app.zip . && cd ..
+    - export ARTIFACT_KEY="releases/${CI_COMMIT_SHA}/app.zip"
+    - aws s3 cp build/app.zip "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
+    - |
+      aws cloudformation deploy         --template-file cloudformation/01-application.yaml         --stack-name "$PREPROD_STACK_NAME"         --parameter-overrides           ArtifactBucketName="$ARTIFACT_BUCKET"           ArtifactKey="$ARTIFACT_KEY"           HostedZoneId="$HOSTED_ZONE_ID"           DomainName="$PREPROD_DOMAIN_NAME"           Environment=preprod         --capabilities CAPABILITY_NAMED_IAM
+
+include:
+  - component: $CI_SERVER_FQDN/aws/continuum/pentest/run-pentest@1
+    inputs:
+      agent-space-id: "$AGENT_SPACE_ID"
+      pentest-id: "$PENTEST_ID"
+      stage: security-gate
+      aws-role-arn: "$SECURITY_AGENT_ROLE_ARN"
+      aws-region: "$AWS_REGION"
+      gitlab-token: "$SA_GITLAB_TOKEN"
+      severity-threshold: "HIGH"
+      on-scope-conflict: "block"
+      timeout-minutes: "45"
+      job-timeout: "55 minutes"
+      # FIRST RUN ONLY:
+      # dry-run: "true"
+
+deploy-prod:
+  stage: deploy-prod
+  needs:
+    - aws-continuum-pentest
+  when: manual
+  image: amazon/aws-cli:latest
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - export AWS_ROLE_ARN="$DEPLOYMENT_ROLE_ARN"
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/gitlab-oidc-token"
+    - printf '%s' "$AWS_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+    - aws sts get-caller-identity
+    - yum install -y zip >/dev/null 2>&1 || true
+  script:
+    - rm -rf build && mkdir build
+    - cd app && zip -q -r ../build/app.zip . && cd ..
+    - export ARTIFACT_KEY="releases/${CI_COMMIT_SHA}/app.zip"
+    - aws s3 cp build/app.zip "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
+    - |
+      aws cloudformation deploy         --template-file cloudformation/01-application.yaml         --stack-name "$PROD_STACK_NAME"         --parameter-overrides           ArtifactBucketName="$ARTIFACT_BUCKET"           ArtifactKey="$ARTIFACT_KEY"           HostedZoneId="$HOSTED_ZONE_ID"           DomainName="$PROD_DOMAIN_NAME"           Environment=prod         --capabilities CAPABILITY_NAMED_IAM
