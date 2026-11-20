@@ -1,352 +1,274 @@
 # AWS Security Agent + GitLab CI/CD POC
 
-A minimal, isolated proof-of-concept showing:
+A minimal proof-of-concept showing:
 
-**Git push → build → CloudFormation deploy to pre-prod → AWS Security Agent scoped penetration test → gate → manual production promotion**
+**Git push → deploy to pre-prod → AWS Security Agent penetration test → gate → manual production promotion**
 
-The application intentionally contains a SQL injection vulnerability so the first run should produce a `HIGH` finding and block production. After fixing the query with a parameterized statement, the next run should pass.
+The sample application has a deliberate SQL injection vulnerability. The first pipeline run should get a `HIGH` finding and block production. After you fix the query, the next run passes.
 
-> **Safety:** Deploy this only to an isolated AWS account/environment. Do not connect it to production data or expose it as a real application. The vulnerability is intentional.
+> **Safety:** Deploy this only to an isolated AWS account. Do not connect it to production data. The vulnerability is intentional.
 
 ## Table of contents
 
-- [Architecture](#architecture)
+- [How it works](#how-it-works)
 - [Repository](#repository)
-- [1. Prerequisites](#1-prerequisites)
-- [2. Create GitLab OIDC provider](#2-create-gitlab-oidc-provider)
-- [3. Bootstrap the artifact bucket](#3-bootstrap-the-artifact-bucket)
-- [4. Create GitLab IAM roles](#4-create-gitlab-iam-roles)
-- [5. Create the first application stack manually](#5-create-the-first-application-stack-manually)
-- [6. Configure AWS Security Agent](#6-configure-aws-security-agent)
-- [7. Configure GitLab variables](#7-configure-gitlab-variables)
-- [8. GitLab pipeline](#8-gitlab-pipeline)
-  - [First run](#first-run)
-  - [Expected vulnerable result](#expected-vulnerable-result)
-  - [Fix and prove the gate passes](#fix-and-prove-the-gate-passes)
-- [9. Important security controls](#9-important-security-controls)
-- [Official references](#official-references)
+- [Before you start](#before-you-start)
+- [Step 1: Set your values](#step-1-set-your-values)
+- [Step 2: Create the GitLab OIDC provider](#step-2-create-the-gitlab-oidc-provider)
+- [Step 3: Create the artifact bucket](#step-3-create-the-artifact-bucket)
+- [Step 4: Create the GitLab IAM roles](#step-4-create-the-gitlab-iam-roles)
+- [Step 5: Deploy pre-prod and test it](#step-5-deploy-pre-prod-and-test-it)
+- [Step 6: Set up AWS Security Agent](#step-6-set-up-aws-security-agent)
+- [Step 7: Configure GitLab](#step-7-configure-gitlab)
+- [Step 8: Run the pipeline](#step-8-run-the-pipeline)
+- [Clean up](#clean-up)
+- [Security notes](#security-notes)
+- [References](#references)
 
-## Architecture
+## How it works
 
 ```text
-                         GitLab
-                            |
-                         push main
-                            |
-                     +------+------+
-                     |             |
-                   Build       Package app
-                                   |
-                                   v
-                         S3 artifact bucket
-                                   |
-                                   v
-                         CloudFormation
-                                   |
-                         +---------+---------+
-                         |                   |
-                    PRE-PROD stack       PROD stack
-                         |                   ^
-                         v                   |
-                Route 53 DNS name            |
-                         |                   |
-                  API Gateway HTTP API       |
-                         |                   |
-                       Lambda                |
-                         |                   |
-                         +---- AWS Security Agent
-                               scoped pentest
-                                      |
-                         +------------+------------+
-                         |                         |
-                     HIGH finding              PASS
-                         |                         |
-                     pipeline FAIL          manual PROD
-                         |                         |
-                       blocked                  promote
+git push (main)
+   │
+   ▼
+build ──────────── validate CloudFormation templates
+   │
+   ▼
+deploy-preprod ─── Lambda + API Gateway + Route 53 name (CloudFormation)
+   │
+   ▼
+aws-continuum-pentest ─── AWS Security Agent tests the deployed change
+   │
+   ├── HIGH finding ──► pipeline fails, production blocked
+   │
+   └── pass ──────────► deploy-prod (manual button)
 ```
 
-AWS Security Agent's GitLab integration is a **post-deployment** gate. It tests the deployed change rather than doing a pull-request-only source scan. The integration is currently public preview and can change. See the official AWS tutorial before productionizing this POC.
+The pentest runs in AWS, not on the GitLab runner. It tests the **deployed** application after each deploy. It is not a pull-request code scan.
 
 ## Repository
 
 ```text
 aws-security-agent-poc/
-├── README.md
-├── .gitignore
-├── .gitlab-ci.yml
+├── .gitlab-ci.yml                         # pipeline
+├── app/index.py                           # vulnerable Lambda (GET /products)
 ├── cloudformation/
-│   ├── 00-artifact-bucket.yaml
-│   ├── 01-application.yaml
-│   └── 02-gitlab-security-agent-iam.yaml
-├── app/
-│   └── index.py
+│   ├── 00-artifact-bucket.yaml            # S3 bucket for Lambda zips
+│   ├── 01-application.yaml                # Lambda, API Gateway, ACM, Route 53
+│   └── 02-gitlab-security-agent-iam.yaml  # GitLab OIDC roles
 └── scripts/
-    ├── package.sh
-    ├── deploy-application.sh
-    └── destroy.sh
+    ├── package.sh                         # zip the app
+    ├── deploy-application.sh              # upload + deploy a stack
+    └── destroy.sh                         # delete the app stacks
 ```
 
-## 1. Prerequisites
+## Before you start
 
 You need:
 
-- AWS account with permissions to create the POC resources.
-- GitLab project on GitLab.com.
-- AWS CLI configured locally for the one-time bootstrap.
-- A Route 53 public hosted zone, for example `example.com`.
-- An AWS Region supported by AWS Security Agent, and the Agent Space / penetration test must be in that Region.
-- A GitLab Project Access Token with `read_api` and `write_repository`, Developer role or higher.
-- GitLab CI/CD project maximum job timeout greater than the gate job timeout.
+- An isolated AWS account, and the AWS CLI logged in to it with admin rights (for the one-time setup).
+- A Route 53 public hosted zone in that account, for example `example.com`.
+- A GitLab.com project containing this repository, with `main` as the default branch.
+- An AWS Region where AWS Security Agent is available.
 
-AWS recommends GitLab OIDC rather than long-lived AWS access keys.
+## Step 1: Set your values
 
-## 2. Create GitLab OIDC provider
-
-Do this once per AWS account if you do not already have the provider:
+Run all commands from the repository root. Set these once in your terminal; every later command uses them. If you open a new terminal, run this block again.
 
 ```bash
-aws iam create-open-id-connect-provider   --url https://gitlab.com   --client-id-list https://gitlab.com
+export AWS_REGION=us-east-1                            # Region for everything, including AWS Security Agent
+export HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ            # Route 53 hosted zone ID
+export PREPROD_DOMAIN=pentest-preprod.example.com      # hostname for the pre-prod app
+export GITLAB_PROJECT=my-group/aws-security-agent-poc  # exact GitLab project path
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ```
 
-If the provider already exists, do not create it again.
+Then edit the top of `.gitlab-ci.yml` to use the same hostnames, and commit:
 
-Get the provider ARN:
+```yaml
+PREPROD_DOMAIN_NAME: pentest-preprod.example.com  # same as PREPROD_DOMAIN
+PROD_DOMAIN_NAME: pentest-prod.example.com
+```
+
+## Step 2: Create the GitLab OIDC provider
+
+This lets GitLab sign in to AWS without access keys. You only need it once per AWS account.
 
 ```bash
-aws iam list-open-id-connect-providers
+aws iam create-open-id-connect-provider \
+  --url https://gitlab.com \
+  --client-id-list https://gitlab.com
 ```
 
-It should look like:
+If you get `EntityAlreadyExists`, the provider is already there. That's fine; continue.
 
-```text
-arn:aws:iam::<ACCOUNT_ID>:oidc-provider/gitlab.com
-```
-
-This approach deliberately avoids embedding a hard-coded certificate thumbprint in CloudFormation.
-
-## 3. Bootstrap the artifact bucket
-
-The application package is uploaded to S3 and CloudFormation points Lambda at that immutable artifact.
+## Step 3: Create the artifact bucket
 
 ```bash
-aws cloudformation deploy   --template-file cloudformation/00-artifact-bucket.yaml   --stack-name security-agent-poc-artifacts
+aws cloudformation deploy \
+  --template-file cloudformation/00-artifact-bucket.yaml \
+  --stack-name security-agent-poc-artifacts
+
+export ARTIFACT_BUCKET=$(aws cloudformation describe-stacks \
+  --stack-name security-agent-poc-artifacts \
+  --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue' \
+  --output text)
+echo "$ARTIFACT_BUCKET"
 ```
 
-Get the bucket name:
+## Step 4: Create the GitLab IAM roles
 
 ```bash
-aws cloudformation describe-stacks   --stack-name security-agent-poc-artifacts   --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue'   --output text
+aws cloudformation deploy \
+  --template-file cloudformation/02-gitlab-security-agent-iam.yaml \
+  --stack-name security-agent-poc-gitlab-iam \
+  --parameter-overrides \
+    GitLabProjectPath="$GITLAB_PROJECT" \
+    GitLabBranch=main \
+    GitLabOIDCProviderArn="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/gitlab.com" \
+    ArtifactBucketName="$ARTIFACT_BUCKET" \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
-## 4. Create GitLab IAM roles
+This creates two roles that only the `main` branch of your project can use:
 
-First get your account ID:
+- **Deployment role:** deploys the application stacks.
+- **Security Agent role:** can only start and read penetration tests.
+
+## Step 5: Deploy pre-prod and test it
+
+AWS Security Agent needs a live site to verify and test, so deploy pre-prod once by hand:
 
 ```bash
-aws sts get-caller-identity --query Account --output text
+ENVIRONMENT=preprod DOMAIN_NAME="$PREPROD_DOMAIN" ./scripts/deploy-application.sh
 ```
 
-Then deploy:
+This takes about 5–10 minutes while the TLS certificate is validated. Then test it:
 
 ```bash
-aws cloudformation deploy   --template-file cloudformation/02-gitlab-security-agent-iam.yaml   --stack-name security-agent-poc-gitlab-iam   --parameter-overrides     GitLabProjectPath=<YOUR_GROUP>/<YOUR_PROJECT>     GitLabBranch=main     GitLabOIDCProviderArn=arn:aws:iam::<ACCOUNT_ID>:oidc-provider/gitlab.com     ArtifactBucketName=<ARTIFACT_BUCKET_NAME>   --capabilities CAPABILITY_NAMED_IAM
+curl "https://${PREPROD_DOMAIN}/products?category=electronics"
 ```
+
+You should get a JSON list of products. To see the vulnerability, this injected input returns every product:
+
+```bash
+curl "https://${PREPROD_DOMAIN}/products?category=x%27%20OR%20%271%27%3D%271"
+```
+
+## Step 6: Set up AWS Security Agent
+
+In the AWS console, open **AWS Security Agent** in the same Region as `AWS_REGION`:
+
+1. Choose **Set up AWS Security Agent**. Create an Agent Space, for example `security-agent-poc`, and select **IAM-only access**.
+2. Open the Agent Space → **Penetration test** tab → **Set up penetration test**. Add your pre-prod domain, select it, and choose **One-click verification**. Keep the default service role.
+3. On the same tab, choose **Add** on the **Connect a source code provider** banner and connect your GitLab project.
+4. Open the **Web app** tab → **Admin access**. Choose **Penetration tests** → **Create a penetration test**:
+   - **Test scope:** Web application
+   - **Target URL:** `https://pentest-preprod.example.com` (your pre-prod domain)
+   - **Credentials** and **VPC:** skip
+   - **Network configuration:** leave as is
+   - **Additional configuration:** add your GitLab repository
+5. Edit the penetration test:
+   - Turn on **CI/CD mode**.
+   - **Continuous testing → Max task hours per run:** `2`.
+6. Write down the **Agent Space ID** (`as-...`) and **Penetration test ID** (`pt-...`).
+
+Optional: run the test once manually from the web app to check it works before involving GitLab. A full manual run can take many hours.
+
+## Step 7: Configure GitLab
+
+**7.1 Create an access token.** In your project: **Settings → Access tokens**. Role: **Developer**. Scopes: `read_api` and `write_repository`. The gate uses it to save which commit it last tested.
+
+**7.2 Add CI/CD variables.** In **Settings → CI/CD → Variables**, add:
+
+| Variable | Value |
+|---|---|
+| `AWS_REGION` | `echo $AWS_REGION` |
+| `HOSTED_ZONE_ID` | `echo $HOSTED_ZONE_ID` |
+| `ARTIFACT_BUCKET` | `echo $ARTIFACT_BUCKET` |
+| `DEPLOYMENT_ROLE_ARN` | `GitLabDeploymentRoleArn` output (command below) |
+| `SECURITY_AGENT_ROLE_ARN` | `GitLabSecurityAgentRoleArn` output (command below) |
+| `AGENT_SPACE_ID` | `as-...` from step 6 |
+| `PENTEST_ID` | `pt-...` from step 6 |
+| `SA_GITLAB_TOKEN` | token from 7.1 (mark it **Masked**) |
 
 Get the role ARNs:
 
 ```bash
-aws cloudformation describe-stacks   --stack-name security-agent-poc-gitlab-iam   --query 'Stacks[0].Outputs'
+aws cloudformation describe-stacks \
+  --stack-name security-agent-poc-gitlab-iam \
+  --query 'Stacks[0].Outputs' --output table
 ```
 
-The stack creates:
+**7.3 Change two settings:**
 
-- `GitLabDeploymentRole`
-- `GitLabSecurityAgentRole`
+- **Settings → CI/CD → General pipelines → Timeout:** `1h` or more. The pentest gate job runs for up to 55 minutes.
+- **Settings → CI/CD → Variables → Minimum role to use pipeline variables:** set it to **Maintainer** or higher, so other users can't weaken the gate when running a pipeline.
 
-The Security Agent role is restricted to the GitLab project and `main` branch in its trust policy.
+## Step 8: Run the pipeline
 
-The deployment role is intentionally broader than a production-grade deployment role because this is a small POC. Tighten it before reuse.
+**8.1 Dry run.** The pipeline starts with `dry-run: "true"`. Push to `main` and check that every job passes. The dry run checks AWS sign-in, the Region and the GitLab connection, but does **not** start a pentest. Don't click `deploy-prod` on this run.
 
-## 5. Create the first application stack manually
-
-Package the Lambda:
-
-```bash
-chmod +x scripts/*.sh
-./scripts/package.sh
-```
-
-Upload it:
-
-```bash
-ARTIFACT_BUCKET=$(aws cloudformation describe-stacks   --stack-name security-agent-poc-artifacts   --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue'   --output text)
-
-aws s3 cp build/app.zip "s3://${ARTIFACT_BUCKET}/releases/initial/app.zip"
-```
-
-Deploy pre-prod:
-
-```bash
-aws cloudformation deploy   --template-file cloudformation/01-application.yaml   --stack-name security-agent-poc-preprod   --parameter-overrides     ArtifactBucketName="$ARTIFACT_BUCKET"     ArtifactKey=releases/initial/app.zip     HostedZoneId=<ROUTE53_HOSTED_ZONE_ID>     DomainName=pentest-preprod.example.com     Environment=preprod   --capabilities CAPABILITY_NAMED_IAM
-```
-
-Wait for the ACM certificate to validate and the custom domain to become available.
-
-Test:
-
-```bash
-curl "https://pentest-preprod.example.com/products?category=electronics"
-```
-
-Try the intentionally vulnerable input:
-
-```bash
-curl "https://pentest-preprod.example.com/products?category=electronics%27%20OR%20%271%27%3D%271"
-```
-
-Do not do this against anything except this isolated POC.
-
-## 6. Configure AWS Security Agent
-
-In AWS Security Agent:
-
-1. Create an Agent Space (**Set up AWS Security Agent**, user access: **IAM-only access**).
-2. In the Agent Space, **Penetration test** tab → **Set up penetration test**. Add `pentest-preprod.example.com` and verify it. Because the hosted zone is in the same AWS account, select the domain and choose **One-click verification**. Keep the default service role that AWS Security Agent creates.
-3. Connect the GitLab repository as the source-control integration (**Connect a source code provider for penetration testing**).
-4. In the web application (**Web app** tab → **Admin access**), create a penetration test:
-   - Test scope: **Web application**
-   - Target URL: `https://pentest-preprod.example.com`
-   - Credentials: none
-   - VPC: none (the target is public)
-   - Network configuration: no accessible domains; optionally mark paths such as `/admin` as **Out of scope**
-   - Additional configuration: add the GitLab repository for application context
-5. Enable CI/CD mode on the penetration test.
-6. Edit the penetration test → **Continuous testing** → **Max task hours per run**: `2` (the minimum), or leave empty for no limit.
-7. Note:
-   - Agent Space ID: `as-...`
-   - Penetration test ID: `pt-...`
-
-Run one manual pentest first. This proves that the application, DNS, domain verification, scope and Security Agent setup work independently of GitLab.
-
-For the first CI/CD validation, use `dry-run: "true"`.
-
-## 7. Configure GitLab variables
-
-In **Settings → CI/CD → Variables**, add:
-
-| Variable | Value |
-|---|---|
-| `AWS_REGION` | Region containing the Agent Space |
-| `HOSTED_ZONE_ID` | Route 53 hosted zone ID |
-| `ARTIFACT_BUCKET` | Artifact bucket output |
-| `DEPLOYMENT_ROLE_ARN` | GitLab deployment role output |
-| `SECURITY_AGENT_ROLE_ARN` | Security Agent role output |
-| `AGENT_SPACE_ID` | `as-...` |
-| `PENTEST_ID` | `pt-...` |
-| `SA_GITLAB_TOKEN` | Project/Group Access Token with `read_api`, `write_repository` |
-
-Mark sensitive values masked/protected where GitLab allows.
-
-Also in GitLab:
-
-- Edit `PREPROD_DOMAIN_NAME` and `PROD_DOMAIN_NAME` at the top of `.gitlab-ci.yml` to hostnames in your hosted zone. The pre-prod name must be the domain verified in AWS Security Agent.
-- **Settings → CI/CD → General pipelines**: set the project maximum job timeout above the gate's `job-timeout` (55 minutes), for example 1 hour.
-- **Settings → CI/CD → Variables**: set the minimum role allowed to override pipeline variables. Otherwise anyone who can run a pipeline can lower the severity threshold or turn on dry-run.
-- **Settings → Repository → Protected tags**: leave `continuum/pentest/cicd/baseline/*` unprotected (the default) so `SA_GITLAB_TOKEN` can create baseline tags.
-
-## 8. GitLab pipeline
-
-The included `.gitlab-ci.yml` does:
-
-1. Validate CloudFormation.
-2. Package the Lambda.
-3. Assume the deployment role using GitLab OIDC.
-4. Upload the application artifact.
-5. Deploy pre-prod with CloudFormation.
-6. Run the AWS Security Agent scoped pentest.
-7. Block production on `HIGH` or higher.
-8. Make production promotion manual only after the gate passes.
-
-The gate job is named `aws-continuum-pentest`, which is the job the production job depends on.
-
-### First run
-
-The repository starts with:
-
-```yaml
-dry-run: "true"
-```
-
-Run the pipeline and verify authentication, Region, GitLab source-control integration and configuration. The dry run does not start a pentest, so the gate passes and `deploy-prod` becomes available; do not promote from this run.
-
-Then remove the `dry-run` input and push again.
-
-The gate also sets `fail-on-error: "true"`. The integration's shipped default is fail-open, which would let an infrastructure error pass the gate without testing anything.
-
-### Expected vulnerable result
-
-The vulnerable version should produce a result similar to:
+**8.2 Vulnerable run.** In `.gitlab-ci.yml`, delete the `dry-run: "true"` line and push. Expected result (the pentest takes tens of minutes):
 
 ```text
-Security Agent
-  Scope decision: IN_SCOPE
-  Finding: SQL injection
-  Severity: HIGH
-  Gate: BLOCK
+deploy-preprod         PASS
+aws-continuum-pentest  FAIL   (SQL injection, HIGH)
+deploy-prod            BLOCKED
 ```
 
-Therefore:
+**8.3 Fix and pass.** In `app/index.py`, make two changes:
+
+1. Replace the whole `query = ( ... )` block with:
+   ```python
+   query = "SELECT name, category, price FROM products WHERE category = ?"
+   ```
+2. Change `cursor.execute(query)` to `cursor.execute(query, (category,))`.
+
+Push. Expected result:
 
 ```text
-deploy-preprod      PASS
-aws-continuum-pentest FAIL
-deploy-prod         BLOCKED
+deploy-preprod         PASS
+aws-continuum-pentest  PASS
+deploy-prod            available (click to deploy)
 ```
 
-### Fix and prove the gate passes
+## Clean up
 
-Change the Lambda query from string concatenation to:
-
-```python
-query = "SELECT name, category, price FROM products WHERE category = ?"
-rows = cursor.execute(query, (category,)).fetchall()
+```bash
+./scripts/destroy.sh   # deletes the pre-prod and prod stacks
+aws cloudformation delete-stack --stack-name security-agent-poc-gitlab-iam
 ```
 
-Push the fix.
+Then, in the console:
 
-The expected flow is:
+- **S3:** select the artifact bucket, choose **Empty**, then **Delete** (it is kept when its stack is deleted).
+- **CloudFormation:** delete `security-agent-poc-artifacts`.
+- **AWS Security Agent:** delete the penetration test and the Agent Space.
+- **IAM → Identity providers:** delete `gitlab.com` if nothing else uses it.
+- **GitLab:** delete the `SA_GITLAB_TOKEN` access token.
 
-```text
-deploy-preprod      PASS
-aws-continuum-pentest PASS
-deploy-prod         MANUAL / AVAILABLE
-```
+## Security notes
 
-The production job then deploys the same artifact to a separate production hostname.
+The POC already does the following. Keep them if you reuse it:
 
-## 9. Important security controls
+- GitLab signs in to AWS with OIDC. There are no stored AWS keys.
+- Both roles trust only your exact project and the `main` branch.
+- The gate blocks on `HIGH` or worse, on scope conflicts (`on-scope-conflict: block`) and on infrastructure errors (`fail-on-error: "true"`; the integration's default is to pass on errors).
+- The artifact bucket is private, encrypted and versioned.
 
-For a real enterprise implementation:
+Before reusing it for real:
 
-- Keep the Security Agent target non-production.
-- Use GitLab OIDC, never static AWS keys.
-- Pin the AWS Security Agent GitLab component to a reviewed release rather than a moving reference.
-- Restrict the OIDC trust `sub` claim to the exact project and branch/environment.
-- Restrict who can override GitLab pipeline variables; otherwise a user who can run a pipeline may be able to lower the gate threshold.
-- Treat scope conflicts as blocking for release gates.
-- Keep `fail-on-error` enabled so infrastructure failures do not silently promote code.
-- Keep the artifact bucket private and encrypted.
-- Prefer immutable artifact keys or object versioning.
-- Use separate AWS accounts/OUs for POC and production.
-- Do not put real secrets, customer data, or production credentials in the vulnerable application.
-- Add CloudTrail, Security Hub, centralized logging and alerting around the CI/CD roles in an enterprise implementation.
+- Tighten the deployment role. It is deliberately broad for this POC.
+- Pin the component to an exact release, for example `run-pentest@v1.0.4` instead of `@1`.
+- Use separate AWS accounts for test and production.
 
-## Official references
+## References
 
-- AWS Security Agent CI/CD overview: https://docs.aws.amazon.com/securityagent/latest/userguide/cicd-pentest.html
-- AWS GitLab tutorial: https://docs.aws.amazon.com/securityagent/latest/userguide/sample-cicd-gitlab.html
-- AWS Security Agent quickstart: https://docs.aws.amazon.com/securityagent/latest/userguide/quickstart.html
-- GitLab AWS OIDC: https://docs.gitlab.com/ci/cloud_services/aws/
+- [AWS Security Agent quickstart](https://docs.aws.amazon.com/securityagent/latest/userguide/quickstart.html)
+- [Run penetration tests from your CI/CD pipeline](https://docs.aws.amazon.com/securityagent/latest/userguide/cicd-pentest.html)
+- [Tutorial: Gate a GitLab CI/CD deployment](https://docs.aws.amazon.com/securityagent/latest/userguide/sample-cicd-gitlab.html)
+- [Create a penetration test](https://docs.aws.amazon.com/securityagent/latest/userguide/perform-penetration-test.html)
+- [GitLab OIDC with AWS](https://docs.gitlab.com/ci/cloud_services/aws/)
 
-AWS currently describes the CI/CD integration as **public preview**, so validate the component version and inputs against the current AWS documentation before using this outside the POC.
+The CI/CD integration is in **public preview**, so check these pages for changes before you start.
