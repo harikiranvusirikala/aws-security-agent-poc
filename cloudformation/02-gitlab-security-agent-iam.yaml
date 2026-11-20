@@ -45,7 +45,13 @@ Resources:
                   - cloudformation:DescribeStacks
                   - cloudformation:DescribeStackEvents
                   - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
                   - cloudformation:ValidateTemplate
+                  # 'aws cloudformation deploy' works through change sets.
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -66,6 +72,11 @@ Resources:
                   - iam:DetachRolePolicy
                   - iam:GetRole
                   - iam:TagRole
+                  - iam:UntagRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:UpdateAssumeRolePolicy
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -75,6 +86,9 @@ Resources:
                   - route53:ChangeResourceRecordSets
                   - route53:GetChange
                   - route53:ListResourceRecordSets
+                  # Needed to validate the AWS::Route53::HostedZone::Id parameter.
+                  - route53:GetHostedZone
+                  - route53:ListHostedZones
                   - acm:RequestCertificate
                   - acm:DescribeCertificate
                   - acm:DeleteCertificate
