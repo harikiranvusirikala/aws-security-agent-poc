@@ -10,7 +10,9 @@ The sample application has a deliberate SQL injection vulnerability. The first p
 
 ## Table of contents
 
-- [How it works](#how-it-works)
+- [Architecture](#architecture)
+  - [Components](#components)
+  - [Pipeline flow](#pipeline-flow)
 - [Repository](#repository)
 - [Before you start](#before-you-start)
 - [Step 1: Set your values](#step-1-set-your-values)
@@ -25,26 +27,33 @@ The sample application has a deliberate SQL injection vulnerability. The first p
 - [Security notes](#security-notes)
 - [References](#references)
 
-## How it works
+## Architecture
 
-```text
-git push (main)
-   │
-   ▼
-build ──────────── validate CloudFormation templates
-   │
-   ▼
-deploy-preprod ─── Lambda + API Gateway + Route 53 name (CloudFormation)
-   │
-   ▼
-aws-continuum-pentest ─── AWS Security Agent tests the deployed change
-   │
-   ├── HIGH finding ──► pipeline fails, production blocked
-   │
-   └── pass ──────────► deploy-prod (manual button)
-```
+### Components
 
-The pentest runs in AWS, not on the GitLab runner. It tests the **deployed** application after each deploy. It is not a pull-request code scan.
+![Architecture: GitLab pipeline, IAM OIDC roles, S3 and CloudFormation, AWS Security Agent, pre-prod and prod stacks](docs/architecture.png)
+
+| Component | Created by | Purpose |
+|---|---|---|
+| GitLab pipeline | `.gitlab-ci.yml` | Validates, deploys pre-prod, runs the pentest gate, then offers a manual prod deploy |
+| IAM OIDC provider | Step 2 (CLI) | Lets GitLab jobs get short-lived AWS credentials, so no access keys are stored |
+| Deployment role | `02-gitlab-security-agent-iam.yaml` | Used by `build`, `deploy-preprod` and `deploy-prod` to upload the zip and deploy stacks |
+| Security Agent role | `02-gitlab-security-agent-iam.yaml` | Used only by the gate job; it can start, poll and stop a pentest and read its findings |
+| S3 artifact bucket | `00-artifact-bucket.yaml` | Stores one private, versioned zip per commit for Lambda |
+| Pre-prod / prod stacks | `01-application.yaml` | Route 53 name → ACM certificate + API Gateway custom domain → HTTP API → Lambda |
+| Lambda app | `app/index.py` | `GET /products?category=...`, backed by SQLite in `/tmp`, vulnerable to SQL injection on purpose |
+| AWS Security Agent | Step 6 (console) | Verifies the pre-prod domain, runs the scoped pentest, and returns findings to the gate |
+| Baseline tags | Security Agent gate | `continuum/pentest/cicd/baseline/*` tags record the last commit that passed, so the next run tests only newer commits |
+
+### Pipeline flow
+
+![Pipeline flow: push, build, deploy pre-prod, pentest gate, then manual prod deploy or production blocked](docs/pipeline-flow.png)
+
+Key points:
+
+- The pentest runs **in AWS**, not on the GitLab runner. The gate job only starts it, waits, and reads the result.
+- It tests the **deployed pre-prod app** after each deploy. It is not a pull-request code scan.
+- Production is never tested or exposed to the pentest; it only receives code that passed the gate.
 
 ## Repository
 

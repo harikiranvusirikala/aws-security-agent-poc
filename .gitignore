@@ -4,3 +4,6 @@ build/
 .env
 .idea/
 .vscode/
+
+# Local diagram sources and third-party icons (AWS Architecture Icons, GitLab logo)
+docs/diagrams/
