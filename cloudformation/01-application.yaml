@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minimal AWS Security Agent POC application.
+
+Parameters:
+  ArtifactBucketName:
+    Type: String
+  ArtifactKey:
+    Type: String
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  DomainName:
+    Type: String
+  Environment:
+    Type: String
+    AllowedValues:
+      - preprod
+      - prod
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub security-agent-poc-${Environment}-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ProductFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub security-agent-poc-${Environment}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: !Ref ArtifactKey
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub security-agent-poc-${Environment}
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+        AllowOrigins:
+          - '*'
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ProductFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ProductsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /products'
+      Target: !Sub integrations/${LambdaIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProductFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub ${HttpApi}/*/*
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  CustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref Certificate
+          EndpointType: REGIONAL
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn:
+      - DefaultStage
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref CustomDomain
+      Stage: !Ref DefaultStage
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt CustomDomain.RegionalHostedZoneId
+
+Outputs:
+  ApplicationUrl:
+    Value: !Sub https://${DomainName}/products?category=electronics
+  DomainName:
+    Value: !Ref DomainName
+  ApiGatewayUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  LambdaFunctionName:
+    Value: !Ref ProductFunction
+  CertificateArn:
+    Value: !Ref Certificate
