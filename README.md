@@ -193,21 +193,21 @@ Do not do this against anything except this isolated POC.
 
 In AWS Security Agent:
 
-1. Create an Agent Space.
-2. Verify `pentest-preprod.example.com` for penetration testing. Because it is in Route 53, use the Route 53 verification option when available.
-3. Create a penetration test.
-4. Target:
-   `https://pentest-preprod.example.com`
-5. Authentication:
-   none.
-6. Network:
-   public.
-7. Keep the scope limited to the target.
-8. Enable CI/CD / continuous testing.
-9. Note:
+1. Create an Agent Space (**Set up AWS Security Agent**, user access: **IAM-only access**).
+2. In the Agent Space, **Penetration test** tab → **Set up penetration test**. Add `pentest-preprod.example.com` and verify it. Because the hosted zone is in the same AWS account, select the domain and choose **One-click verification**. Keep the default service role that AWS Security Agent creates.
+3. Connect the GitLab repository as the source-control integration (**Connect a source code provider for penetration testing**).
+4. In the web application (**Web app** tab → **Admin access**), create a penetration test:
+   - Test scope: **Web application**
+   - Target URL: `https://pentest-preprod.example.com`
+   - Credentials: none
+   - VPC: none (the target is public)
+   - Network configuration: no accessible domains; optionally mark paths such as `/admin` as **Out of scope**
+   - Additional configuration: add the GitLab repository for application context
+5. Enable CI/CD mode on the penetration test.
+6. Edit the penetration test → **Continuous testing** → **Max task hours per run**: `2` (the minimum), or leave empty for no limit.
+7. Note:
    - Agent Space ID: `as-...`
    - Penetration test ID: `pt-...`
-10. Connect the GitLab repository as the source-control integration.
 
 Run one manual pentest first. This proves that the application, DNS, domain verification, scope and Security Agent setup work independently of GitLab.
 
@@ -230,7 +230,12 @@ In **Settings → CI/CD → Variables**, add:
 
 Mark sensitive values masked/protected where GitLab allows.
 
-Also configure the GitLab project maximum job timeout to be greater than the Security Agent gate's `job-timeout`.
+Also in GitLab:
+
+- Edit `PREPROD_DOMAIN_NAME` and `PROD_DOMAIN_NAME` at the top of `.gitlab-ci.yml` to hostnames in your hosted zone. The pre-prod name must be the domain verified in AWS Security Agent.
+- **Settings → CI/CD → General pipelines**: set the project maximum job timeout above the gate's `job-timeout` (55 minutes), for example 1 hour.
+- **Settings → CI/CD → Variables**: set the minimum role allowed to override pipeline variables. Otherwise anyone who can run a pipeline can lower the severity threshold or turn on dry-run.
+- **Settings → Repository → Protected tags**: leave `continuum/pentest/cicd/baseline/*` unprotected (the default) so `SA_GITLAB_TOKEN` can create baseline tags.
 
 ## 8. GitLab pipeline
 
@@ -255,9 +260,11 @@ The repository starts with:
 dry-run: "true"
 ```
 
-Run the pipeline and verify authentication, Region, GitLab source-control integration and configuration.
+Run the pipeline and verify authentication, Region, GitLab source-control integration and configuration. The dry run does not start a pentest, so the gate passes and `deploy-prod` becomes available; do not promote from this run.
 
 Then remove the `dry-run` input and push again.
+
+The gate also sets `fail-on-error: "true"`. The integration's shipped default is fail-open, which would let an infrastructure error pass the gate without testing anything.
 
 ### Expected vulnerable result
 
