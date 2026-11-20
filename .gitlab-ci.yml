@@ -17,21 +17,16 @@ workflow:
 variables:
   PREPROD_STACK_NAME: security-agent-poc-preprod
   PROD_STACK_NAME: security-agent-poc-prod
+  # Replace with hostnames in your Route 53 hosted zone.
   PREPROD_DOMAIN_NAME: pentest-preprod.example.com
   PROD_DOMAIN_NAME: pentest-prod.example.com
 
-build:
-  stage: build
-  image: amazon/aws-cli:latest
-  script:
-    - aws cloudformation validate-template --template-body file://cloudformation/00-artifact-bucket.yaml
-    - aws cloudformation validate-template --template-body file://cloudformation/01-application.yaml
-    - aws cloudformation validate-template --template-body file://cloudformation/02-gitlab-security-agent-iam.yaml
-    - echo "CloudFormation validation passed."
-
-deploy-preprod:
-  stage: deploy-preprod
-  image: amazon/aws-cli:latest
+# Shared setup: the aws-cli image's entrypoint is "aws", so it must be cleared
+# for GitLab to run the job script. Credentials come from GitLab OIDC.
+.aws-oidc:
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
   id_tokens:
     AWS_OIDC_TOKEN:
       aud: https://gitlab.com
@@ -41,13 +36,44 @@ deploy-preprod:
     - printf '%s' "$AWS_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
     - aws sts get-caller-identity
     - yum install -y zip >/dev/null 2>&1 || true
+
+.deploy-app:
+  extends: .aws-oidc
   script:
     - rm -rf build && mkdir build
     - cd app && zip -q -r ../build/app.zip . && cd ..
     - export ARTIFACT_KEY="releases/${CI_COMMIT_SHA}/app.zip"
     - aws s3 cp build/app.zip "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
     - |
-      aws cloudformation deploy         --template-file cloudformation/01-application.yaml         --stack-name "$PREPROD_STACK_NAME"         --parameter-overrides           ArtifactBucketName="$ARTIFACT_BUCKET"           ArtifactKey="$ARTIFACT_KEY"           HostedZoneId="$HOSTED_ZONE_ID"           DomainName="$PREPROD_DOMAIN_NAME"           Environment=preprod         --capabilities CAPABILITY_NAMED_IAM
+      aws cloudformation deploy \
+        --template-file cloudformation/01-application.yaml \
+        --stack-name "$STACK_NAME" \
+        --parameter-overrides \
+          ArtifactBucketName="$ARTIFACT_BUCKET" \
+          ArtifactKey="$ARTIFACT_KEY" \
+          HostedZoneId="$HOSTED_ZONE_ID" \
+          DomainName="$DOMAIN_NAME" \
+          Environment="$ENVIRONMENT" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --no-fail-on-empty-changeset
+
+build:
+  stage: build
+  extends: .aws-oidc
+  script:
+    - aws cloudformation validate-template --template-body file://cloudformation/00-artifact-bucket.yaml
+    - aws cloudformation validate-template --template-body file://cloudformation/01-application.yaml
+    - aws cloudformation validate-template --template-body file://cloudformation/02-gitlab-security-agent-iam.yaml
+    - echo "CloudFormation validation passed."
+
+deploy-preprod:
+  stage: deploy-preprod
+  extends: .deploy-app
+  environment: preprod
+  variables:
+    STACK_NAME: $PREPROD_STACK_NAME
+    DOMAIN_NAME: $PREPROD_DOMAIN_NAME
+    ENVIRONMENT: preprod
 
 include:
   - component: $CI_SERVER_FQDN/aws/continuum/pentest/run-pentest@1
@@ -60,30 +86,22 @@ include:
       gitlab-token: "$SA_GITLAB_TOKEN"
       severity-threshold: "HIGH"
       on-scope-conflict: "block"
+      # Default is fail-open: an infrastructure error would pass the gate.
+      fail-on-error: "true"
       timeout-minutes: "45"
       job-timeout: "55 minutes"
-      # FIRST RUN ONLY:
-      # dry-run: "true"
+      # FIRST RUN ONLY: validates OIDC, Region and repository integration
+      # without starting a pentest. Remove this line once the dry run passes.
+      dry-run: "true"
 
 deploy-prod:
   stage: deploy-prod
+  extends: .deploy-app
   needs:
     - aws-continuum-pentest
   when: manual
-  image: amazon/aws-cli:latest
-  id_tokens:
-    AWS_OIDC_TOKEN:
-      aud: https://gitlab.com
-  before_script:
-    - export AWS_ROLE_ARN="$DEPLOYMENT_ROLE_ARN"
-    - export AWS_WEB_IDENTITY_TOKEN_FILE="/tmp/gitlab-oidc-token"
-    - printf '%s' "$AWS_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
-    - aws sts get-caller-identity
-    - yum install -y zip >/dev/null 2>&1 || true
-  script:
-    - rm -rf build && mkdir build
-    - cd app && zip -q -r ../build/app.zip . && cd ..
-    - export ARTIFACT_KEY="releases/${CI_COMMIT_SHA}/app.zip"
-    - aws s3 cp build/app.zip "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
-    - |
-      aws cloudformation deploy         --template-file cloudformation/01-application.yaml         --stack-name "$PROD_STACK_NAME"         --parameter-overrides           ArtifactBucketName="$ARTIFACT_BUCKET"           ArtifactKey="$ARTIFACT_KEY"           HostedZoneId="$HOSTED_ZONE_ID"           DomainName="$PROD_DOMAIN_NAME"           Environment=prod         --capabilities CAPABILITY_NAMED_IAM
+  environment: production
+  variables:
+    STACK_NAME: $PROD_STACK_NAME
+    DOMAIN_NAME: $PROD_DOMAIN_NAME
+    ENVIRONMENT: prod
