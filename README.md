@@ -8,6 +8,24 @@ The application intentionally contains a SQL injection vulnerability so the firs
 
 > **Safety:** Deploy this only to an isolated AWS account/environment. Do not connect it to production data or expose it as a real application. The vulnerability is intentional.
 
+## Table of contents
+
+- [Architecture](#architecture)
+- [Repository](#repository)
+- [1. Prerequisites](#1-prerequisites)
+- [2. Create GitLab OIDC provider](#2-create-gitlab-oidc-provider)
+- [3. Bootstrap the artifact bucket](#3-bootstrap-the-artifact-bucket)
+- [4. Create GitLab IAM roles](#4-create-gitlab-iam-roles)
+- [5. Create the first application stack manually](#5-create-the-first-application-stack-manually)
+- [6. Configure AWS Security Agent](#6-configure-aws-security-agent)
+- [7. Configure GitLab variables](#7-configure-gitlab-variables)
+- [8. GitLab pipeline](#8-gitlab-pipeline)
+  - [First run](#first-run)
+  - [Expected vulnerable result](#expected-vulnerable-result)
+  - [Fix and prove the gate passes](#fix-and-prove-the-gate-passes)
+- [9. Important security controls](#9-important-security-controls)
+- [Official references](#official-references)
+
 ## Architecture
 
 ```text
