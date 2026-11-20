@@ -83,7 +83,7 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref ProductFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub ${HttpApi}/*/*
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
 
   Certificate:
     Type: AWS::CertificateManager::Certificate
